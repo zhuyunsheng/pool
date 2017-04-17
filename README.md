@@ -1,2 +1,2 @@
 # pool
-grpc  client pool
+go rpc   client pool
