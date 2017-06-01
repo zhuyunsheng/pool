@@ -34,10 +34,6 @@ type idleConn struct {
 
 //NewChannelPool 初始化链接
 func NewPool(poolConf *PoolConf) (Pool, error) {
-	if poolConf.MinCap < 0 || poolConf.MaxCap <= 0 || poolConf.MinCap > poolConf.MaxCap {
-		return nil, errors.New("invalid capacity settings")
-	}
-
 	c := &pool{
 		conns:       make(chan *idleConn, poolConf.MaxCap),
 		new:         poolConf.New,
@@ -46,11 +42,15 @@ func NewPool(poolConf *PoolConf) (Pool, error) {
 		idleTimeout: poolConf.IdleTimeout,
 	}
 
+	if poolConf.MinCap < 0 || poolConf.MaxCap <= 0 || poolConf.MinCap > poolConf.MaxCap {
+		return c, errors.New("invalid capacity settings")
+	}
+
 	for i := 0; i < poolConf.MinCap; i++ {
 		conn, err := c.new()
 		if err != nil {
 			c.Release()
-			return nil, fmt.Errorf("new is not able to fill the pool: %s", err)
+			return c, fmt.Errorf("new is not able to fill the pool: %s", err)
 		}
 		c.conns <- &idleConn{conn: conn, t: time.Now()}
 	}
@@ -68,9 +68,6 @@ func (c *pool) getConnAll() chan *idleConn {
 //Get 从pool中取一个连接
 func (c *pool) Get() (interface{}, error) {
 	connAll := c.getConnAll()
-	if connAll == nil {
-		return nil, ErrClosed
-	}
 	for {
 		select {
 		case wrapConn := <-connAll:
@@ -87,18 +84,22 @@ func (c *pool) Get() (interface{}, error) {
 					continue
 				}
 			}
+			c.mx.Lock()
+			c.active--
+			c.mx.Unlock()
 			return wrapConn.conn, nil
 		default:
 			c.mx.Lock()
 			if c.active > c.maxCap {
 				c.mx.Unlock()
-				 time.Sleep(time.Millisecond*50)
+				time.Sleep(time.Millisecond * 50)
+				fmt.Println("连接池已用完,请等待:", time.Now())
 				continue
 			}
 			defer c.mx.Unlock()
 			conn, err := c.new()
 			if err != nil {
-				return nil, err
+				return conn, err
 			}
 			c.active++
 			return conn, nil
@@ -133,6 +134,9 @@ func (c *pool) Put(conn interface{}) error {
 
 //Close 关闭单条连接
 func (c *pool) Close(conn interface{}) error {
+	c.mx.Lock()
+	c.active--
+	c.mx.Unlock()
 	if conn == nil {
 		return errors.New("connection is nil. rejecting")
 	}
@@ -143,10 +147,7 @@ func (c *pool) Close(conn interface{}) error {
 func (c *pool) Release() {
 	c.mx.Lock()
 	conns := c.conns
-	c.conns = nil
-	c.new = nil
 	closeFun := c.close
-	c.close = nil
 	c.active = 0
 	c.mx.Unlock()
 
@@ -154,9 +155,10 @@ func (c *pool) Release() {
 		return
 	}
 
-	close(conns)
-	for wrapConn := range conns {
-		closeFun(wrapConn.conn)
+	if len(conns) > 0 {
+		for wrapConn := range conns {
+			closeFun(wrapConn.conn)
+		}
 	}
 }
 
